@@ -6,19 +6,42 @@ typeset -x PATH="$sysdir/bin:$PATH"
 
 cd $mydir
 
+# Lightweight logging (toggle with VIMM_CLIENT_LOG=1)
+LOG_FILE="$mydir/client.log"
+if [ "$VIMM_CLIENT_LOG" = "1" ]; then
+  exec 2>>"$LOG_FILE"
+  echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - Starting client.sh (pwd=$mydir)" >>"$LOG_FILE"
+  trap 'ec=$?; echo "[INFO] $(date "+%Y-%m-%d %H:%M:%S") - Exiting with code $ec" >>"$LOG_FILE"' EXIT
+  log(){ echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $*" >>"$LOG_FILE"; }
+else
+  log(){ :; }
+fi
+
 decode_base64() {
     echo "$1" | base64 -d
 }
 
 getFileSize() {
 	local input=$1
-	local grandezze=('1' '1024' '1048576')
-	local unit=('KB' 'MB' 'GB')
-	local grandezza unit_calcolata result
-	for i in $(seq ${#grandezze[@]} -1 1); do
-		grandezza=${grandezze[$i - 1]}
+	# Validate numeric input (non-empty, digits only, > 0)
+	case "$input" in
+		''|*[!0-9]*) fileSize=""; log "getFileSize: invalid or empty input '$input'"; return ;;
+	esac
+	if [ "$input" -le 0 ]; then
+		fileSize=""
+		return
+	fi
+	# Thresholds are in KB; zsh arrays are 1-based
+	local -a grandezze unit
+	grandezze=(1 1024 1048576)
+	unit=(KB MB GB)
+	local grandezza unit_calcolata result i
+	for i in 3 2 1; do
+		grandezza=${grandezze[$i]}
+		[ -z "$grandezza" ] && continue
+		[ "$grandezza" -eq 0 ] && continue
 		if [ "$input" -ge "$grandezza" ]; then
-			unit_calcolata=${unit[$i - 1]}
+			unit_calcolata=${unit[$i]}
 			result=$((input * 10 / grandezza))
 			fileSize="$((result / 10)) $unit_calcolata"
 			return
@@ -58,6 +81,7 @@ cleanup(){
 	imageFileName=""
 	headers=""
 	fileSize=""
+	expectedSizeBytes=""
 	filePath=""
 	list=""
 	letter=""
@@ -108,7 +132,7 @@ case $CHOICE in
             search_name
             ;;
         4)
-            longdialoginfo "Miyoo Vimm's Lair Client - Version: 1.7"
+            longdialoginfo "Miyoo Vimm's Lair Client - Version: 1.7.1"
 			sleep 2
 			mainmenu
             ;;
@@ -164,21 +188,32 @@ search_vaultId() {
 
 get_mediaId() {
 	url="https://vimm.net/vault/$vaultId"
+	log "Navigating to $url"
 	response=$(curl -s -k $url)
-	if [ $? -ne 0 ]; then
+	if [ $? -ne 0 ] || [ -z "$response" ]; then
 		longdialoginfo "Error on HTTP connection..."
+		log "HTTP error fetching vault page for $vaultId"
 		sleep 1
 		return
 	fi
-	local MEDIA = () ; unset MEDIA ; unset MEDIA
-	echo "$response" | tr ';' '\n' | grep -i "var allMedia = .*" | sed 's/.*\[/\[/' >> allMedia
-	ids_and_titles=$(jq -r '.[] | "\(.ID) \(.GoodTitle)"' allMedia)
-	echo "$ids_and_titles" | while IFS=" " read -r id encoded_title; do
-		goodTitle=$(decode_base64 "$encoded_title")
-		MEDIA+=(${id} ${goodTitle})
-	done
+	# Prepare media list
+	local -a MEDIA
+	MEDIA=()
+	ALLMEDIA_FILE=$(mktemp 2>/dev/null) || ALLMEDIA_FILE=/tmp/allMedia.$$ 
+	echo "$response" | tr ';' '\n' | grep -i "var allMedia = .*" | sed 's/.*\[/\[/' > "$ALLMEDIA_FILE"
+	if command -v jq >/dev/null 2>&1; then
+		ids_and_titles=$(jq -r '.[] | "\(.ID) \(.GoodTitle)"' "$ALLMEDIA_FILE")
+		for line in ${(f)ids_and_titles}; do
+			id=${${line%% *}}
+			encoded_title=${${line#* }}
+			goodTitle=$(decode_base64 "$encoded_title")
+			MEDIA+=(${id} ${goodTitle})
+		done
+	else
+		log "jq not available; skipping optional media menu population"
+	fi
 	mediaId=$(echo "$response" | sed -n 's/.*mediaId" value="\([^"]*\).*/\1/p')
-	getFileSize $(grep $mediaId allMedia | sed -n 's/.*"Zipped":"\([^"]*\)".*/\1/p')
+	getFileSize $(grep $mediaId "$ALLMEDIA_FILE" | sed -n 's/.*"Zipped":"\([^"]*\)".*/\1/p')
 	size=${#MEDIA[@]}
 	if [ $size -gt 2 ]; then
 		$DIALOG --no-lines --title "Found more discs or versions: $(( size / 2 ))" --cancel-label "Back" --ok-label "Select" \
@@ -187,29 +222,31 @@ get_mediaId() {
 		if [ $ret -ne 0 ]; then
 			mediaId="NO_SEL"
 			fileSize=""
-			rm -rf allMedia
+			rm -f "$ALLMEDIA_FILE"
 			return
 		fi
-		if [ $? -eq 0 ]; then
+		if [ $ret -eq 0 ]; then
 			mediaId=$(<$DIALOG_TEMPFILE)
 			if [ "$mediaId" = "" ]; then
 				longdialoginfo "You didn't choose any media ID, the default one will be selected."
+				log "User didn't choose media; using default"
 				sleep 1
 				mediaId=$(echo "$response" | sed -n 's/.*mediaId" value="\([^"]*\).*/\1/p')
-				rm -rf allMedia
+				rm -f "$ALLMEDIA_FILE"
 				return
 			fi
-			getFileSize $(grep $mediaId allMedia | sed -n 's/.*"Zipped":"\([^"]*\)".*/\1/p')
+			getFileSize $(grep $mediaId "$ALLMEDIA_FILE" | sed -n 's/.*"Zipped":"\([^"]*\)".*/\1/p')
 			if [ "$fileSize" = "" ]; then
 				fileSize=$(echo "$response" | sed -n 's/.*download_size">\([^"]*\).*/\1/p' | sed -n 's/<.*//p')
 			fi
-			rm -rf allMedia
+			rm -f "$ALLMEDIA_FILE"
 			return
 		fi
 		longdialoginfo "You didn't choose any media ID, the default one will be selected."
+		log "Dialog closed without selection; using default"
 		sleep 1
 	fi
-	rm -rf allMedia
+	rm -f "$ALLMEDIA_FILE"
 }
 
 get_filePath() {
@@ -243,14 +280,53 @@ get_filePath() {
 }
 
 get_gameName() {
-	url=https://download2.vimm.net/?mediaId=$mediaId
-	headers=$(curl -sI -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0" --insecure $url)
-	gameName=$(echo "$headers" | grep -o -E "filename=.*" | cut -d'=' -f2 | cut -d'"' -f2)
-	if [ "$gameName" = "" ]; then
-		url=https://download3.vimm.net/?mediaId=$mediaId
-		headers=$(curl -sI -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0" --insecure $url)
-		gameName=$(echo "$headers" | grep -o -E "filename=.*" | cut -d'=' -f2 | cut -d'"' -f2)
+	url=https://dl2.vimm.net/?mediaId=$mediaId
+	log "Fetching headers for mediaId=$mediaId from $url"
+	headers=$(curl -sIL -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0" --insecure $url)
+	# Try Content-Disposition filename first (case-insensitive)
+	gameName=$(echo "$headers" | grep -i -o -E "filename=.*" | cut -d'=' -f2 | cut -d'"' -f2)
+	if [ -z "$gameName" ]; then
+		url=https://dl3.vimm.net/?mediaId=$mediaId
+		log "dl2 failed to provide filename; trying $url"
+		headers=$(curl -sIL -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0" --insecure $url)
+		gameName=$(echo "$headers" | grep -i -o -E "filename=.*" | cut -d'=' -f2 | cut -d'"' -f2)
 	fi
+	if [ -z "$gameName" ]; then
+		url=https://dl1.vimm.net/?mediaId=$mediaId
+		log "dl3 failed too; trying $url"
+		headers=$(curl -sIL -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0" --insecure $url)
+		gameName=$(echo "$headers" | grep -i -o -E "filename=.*" | cut -d'=' -f2 | cut -d'"' -f2)
+	fi
+	# Legacy hosts as additional fallbacks
+	if [ -z "$gameName" ]; then
+		url=https://download2.vimm.net/?mediaId=$mediaId
+		log "dl hosts failed; trying legacy $url"
+		headers=$(curl -sIL -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0" --insecure $url)
+		gameName=$(echo "$headers" | grep -i -o -E "filename=.*" | cut -d'=' -f2 | cut -d'"' -f2)
+	fi
+	if [ -z "$gameName" ]; then
+		url=https://download3.vimm.net/?mediaId=$mediaId
+		log "Trying legacy $url"
+		headers=$(curl -sIL -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0" --insecure $url)
+		gameName=$(echo "$headers" | grep -i -o -E "filename=.*" | cut -d'=' -f2 | cut -d'"' -f2)
+	fi
+	if [ -z "$gameName" ]; then
+		url=https://download1.vimm.net/?mediaId=$mediaId
+		log "Trying legacy $url"
+		headers=$(curl -sIL -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0" --insecure $url)
+		gameName=$(echo "$headers" | grep -i -o -E "filename=.*" | cut -d'=' -f2 | cut -d'"' -f2)
+	fi
+	# Fallback: try to infer from final Location URL path
+	if [ -z "$gameName" ]; then
+		loc=$(echo "$headers" | grep -i '^Location:' | tail -n1 | awk '{print $2}')
+		if [ -n "$loc" ]; then
+			# Decode a few common URL-encodings and take basename
+			gameName=$(basename "$loc" | sed 's/%20/ /g; s/%5[Bb]/[/g; s/%5[Dd]/]/g; s/%28/(/g; s/%29/)/g; s/%26/&/g')
+		fi
+	fi
+	# Try to capture expected size (bytes) for progress gauge
+	expectedSizeBytes=$(echo "$headers" | awk -F': ' 'tolower($1)=="content-length"{print $2}' | tail -n1 | tr -d '\r')
+	log "Resolved gameName='$gameName' (Content-Length=$expectedSizeBytes)"
 	sleep 1
 }
 
@@ -260,38 +336,58 @@ get_imageName() {
 }
 
 download_game() {
-	response=$(curl -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0"  --insecure -o "$gameName" $url)
-	if [ $? -ne 0 ]; then
-		longdialoginfo "Error while downloading game..."
+	# Sanity checks
+	if [ -z "$url" ] || [ -z "$gameName" ] || [ -z "$filePath" ]; then
+		log "download_game: missing vars url='$url' gameName='$gameName' filePath='$filePath'"
+		longdialoginfo "Internal error: missing information to download."
 		res="NOK"
 		sleep 1
 		return
 	fi
+	# Ensure destination exists first
+	mkdir -p "$filePath" "$filePath/Imgs" 2>/dev/null
+	log "Downloading game to '$filePath/$gameName' from $url"
+	# Show curl's native progress on-screen by sending stderr to tty
+	curl -L -X GET -H "Referer: https://vimm.net/vault/$vaultId" -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0" --insecure -o "$filePath/$gameName" "$url" 2>/dev/tty
+	ret=$?
+	if [ $ret -ne 0 ]; then
+		longdialoginfo "Error while downloading game..."
+		log "curl download failed (game)"
+		res="NOK"
+		sleep 1
+		return
+	fi
+	# Uncompress if requested
 	if [ -z "${gameName##*.7z*}" ]; then
 		$($DIALOG --no-lines --yesno "Do you want to uncompress downloaded file?" 0 0 2>&1 >/dev/tty)
-	        if [ $? -eq 0 ]; then
-			7z x "$gameName"
-			rm -rf "$gameName"
+		if [ $? -eq 0 ]; then
+			shortdialoginfo "Extracting archive..."
+			7z x "$filePath/$gameName" -o"$filePath/${gameName%.*}"
+			rm -rf "$filePath/$gameName"
 			gameName="${gameName%.*}"
 		fi
 	fi
 	if [ -z "${gameName##*.zip*}" ]; then
 		$($DIALOG --no-lines --yesno "Do you want to uncompress downloaded file?" 0 0 2>&1 >/dev/tty)
-	        if [ $? -eq 0 ]; then
-			7z x "$gameName" -o"${gameName%.*}"
-			rm -rf "$gameName"
+		if [ $? -eq 0 ]; then
+			shortdialoginfo "Extracting archive..."
+			7z x "$filePath/$gameName" -o"$filePath/${gameName%.*}"
+			rm -rf "$filePath/$gameName"
 			gameName="${gameName%.*}"
 		fi
 	fi
-	mv "$gameName" $filePath/.
+	# Download boxart directly to destination
 	url=https://raw.githubusercontent.com/libretro-thumbnails/$platform/master/Named_Boxarts/$imageName
-	response=$(curl -X GET --insecure -o "$imageFileName" $url)
-	if [ $? -ne 0 ]; then
+	shortdialoginfo "Downloading boxart..."
+	log "Downloading boxart '$imageFileName' from $url"
+	response=$(curl -L -X GET --insecure -o "$filePath/Imgs/$imageFileName" $url)
+	if [ $? -ne 0 ] || [ ! -s "$filePath/Imgs/$imageFileName" ]; then
 		longdialoginfo "Error while downloading BoxArt..."
+		log "curl download failed (boxart) or file empty"
 		sleep 1	
 		return
 	fi
-	mv "$imageFileName" $filePath/Imgs/.
+	log "Saved game to $filePath/$gameName and boxart to $filePath/Imgs/$imageFileName"
 }
 
 browse_platform() {
