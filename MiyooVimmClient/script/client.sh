@@ -362,18 +362,64 @@ download_game() {
 		$($DIALOG --no-lines --yesno "Do you want to uncompress downloaded file?" 0 0 2>&1 >/dev/tty)
 		if [ $? -eq 0 ]; then
 			shortdialoginfo "Extracting archive..."
-			7z x "$filePath/$gameName" -o"$filePath/${gameName%.*}"
+			# Extract to a temporary directory first
+			tmpdir=$(mktemp -d "$filePath/.extract.XXXXXX" 2>/dev/null) || tmpdir="$filePath/.extract_tmp_$$"
+			mkdir -p "$tmpdir"
+			7z x "$filePath/$gameName" -o"$tmpdir"
+			# Determine target dir named after the game (sanitize apostrophes to hyphens)
+			base_name="${gameName%.*}"
+			safe_base="${base_name//\'/-}"
+			target_dir="$filePath/$safe_base"
+			mkdir -p "$target_dir"
+			# If archive contains a single top-level directory, move its contents; otherwise move all
+			single_dir=""
+			for i in "$tmpdir"/*; do
+				if [ -z "$single_dir" ] && [ -d "$i" ]; then
+					single_dir="$i"
+				else
+					single_dir=""
+					break
+				fi
+			done
+			# Move all entries (including hidden) from source to target safely
+			src_dir="$tmpdir"
+			[ -n "$single_dir" ] && src_dir="$single_dir"
+			find "$src_dir" -mindepth 1 -maxdepth 1 -exec mv -f {} "$target_dir"/ \;
+			rm -rf "$tmpdir"
 			rm -rf "$filePath/$gameName"
-			gameName="${gameName%.*}"
+			gameName="$safe_base"
 		fi
 	fi
 	if [ -z "${gameName##*.zip*}" ]; then
 		$($DIALOG --no-lines --yesno "Do you want to uncompress downloaded file?" 0 0 2>&1 >/dev/tty)
 		if [ $? -eq 0 ]; then
 			shortdialoginfo "Extracting archive..."
-			7z x "$filePath/$gameName" -o"$filePath/${gameName%.*}"
+			# Extract to a temporary directory first
+			tmpdir=$(mktemp -d "$filePath/.extract.XXXXXX" 2>/dev/null) || tmpdir="$filePath/.extract_tmp_$$"
+			mkdir -p "$tmpdir"
+			7z x "$filePath/$gameName" -o"$tmpdir"
+			# Determine target dir named after the game (sanitize apostrophes to hyphens)
+			base_name="${gameName%.*}"
+			safe_base="${base_name//\'/-}"
+			target_dir="$filePath/$safe_base"
+			mkdir -p "$target_dir"
+			# If archive contains a single top-level directory, move its contents; otherwise move all
+			single_dir=""
+			for i in "$tmpdir"/*; do
+				if [ -z "$single_dir" ] && [ -d "$i" ]; then
+					single_dir="$i"
+				else
+					single_dir=""
+					break
+				fi
+			done
+			# Move all entries (including hidden) from source to target safely
+			src_dir="$tmpdir"
+			[ -n "$single_dir" ] && src_dir="$single_dir"
+			find "$src_dir" -mindepth 1 -maxdepth 1 -exec mv -f {} "$target_dir"/ \;
+			rm -rf "$tmpdir"
 			rm -rf "$filePath/$gameName"
-			gameName="${gameName%.*}"
+			gameName="$safe_base"
 		fi
 	fi
 	# Download boxart directly to destination
